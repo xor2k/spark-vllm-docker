@@ -45,7 +45,7 @@ RUN apt update && \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
     python3-dev python3-pip git wget \
     libibverbs1 libibverbs-dev rdma-core \
-    ccache devscripts debhelper fakeroot \
+    ccache devscripts debhelper fakeroot unzip \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -78,9 +78,25 @@ WORKDIR $VLLM_BASE_DIR
 #     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
 #     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
-RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
-    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
-    make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./build/pkg/deb/*.deb
+# v2.30u1 from git matches best 2.30.3 from PyPi (for the header files)
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    set -eux; \
+    git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git /workspace/vllm/nccl; \
+    make -C /workspace/vllm/nccl -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"; \
+    mkdir -p /tmp/nccl-wheel /workspace/wheels; \
+    pip download "nvidia-nccl-cu13==2.30.3" -d /tmp/nccl-wheel; \
+    WHL="$(ls /tmp/nccl-wheel/nvidia_nccl_cu13-*.whl | head -n1)"; \
+    unzip "$WHL" -d /tmp/nccl-wheel/unpacked; \
+    cp -L /workspace/vllm/nccl/build/lib/libnccl.so.2 /tmp/nccl-wheel/unpacked/nvidia/nccl/lib/libnccl.so.2; \
+    rm "$WHL"; \
+    cd /tmp/nccl-wheel/unpacked; \
+    python3 -m wheel pack . -d /workspace/wheels
+
+# =========================================================
+# STAGE 1.5: NCCL Wheel Export
+# =========================================================
+FROM scratch AS nccl-export
+COPY --from=base /workspace/wheels /
 
 # =========================================================
 # STAGE 2: FlashInfer Builder
@@ -338,14 +354,12 @@ ENV UV_LINK_MODE=copy
 
 # Mount additional packages from base builder image
 # Install runtime dependencies
-RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target=/workspace/nccl-pkg \
-    apt update && \
+RUN apt update && \
     apt install -y --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
-    && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -364,15 +378,23 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
+RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
+    set -eux; \
+    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__.split('+')[0])"); \
+    NCCL_WHEEL=$(ls /workspace/wheels/nvidia_nccl_cu13-*.whl | head -n1); \
+    test -e "${NCCL_WHEEL}"; \
+    { \
+        echo "torch==${PINNED_TORCH}"; \
+        echo "nvidia-nccl-cu13 @ file://${NCCL_WHEEL}"; \
+        if [ "$PRE_TRANSFORMERS" = "1" ]; then \
+            echo "transformers>=5.0.0"; \
+        fi; \
+    } > /tmp/wheel-override.txt
+
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
 # With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
-    echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
-    if [ "$PRE_TRANSFORMERS" = "1" ]; then \
-        echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
-    fi && \
     uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt
 
 # Setup environment for runtime
@@ -388,15 +410,10 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Final extra deps
 # Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
-    echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
+    --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor \
-        --override /tmp/torch-override.txt
+        --override /tmp/wheel-override.txt
 
-# Fix NCCL
-RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
-    ln -s /usr/lib/aarch64-linux-gnu/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
-    
 # Build metadata (generated by build-and-copy.sh)
 COPY build-metadata.yaml /workspace/build-metadata.yaml
